@@ -1,0 +1,12 @@
+# Runtime dependencies for Stage 1 (ingestion + AST chunking).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+GitPython==3.1.44
+
+# tree-sitter: the modern (>=0.23) binding plus the actively maintained
+# language pack. NOTE: the older `tree-sitter-languages` package is unmaintained
+# and pins tree-sitter<0.22 -- do not use it. `tree-sitter-language-pack` ships
+# prebuilt wheels for python/typescript/tsx/javascript.
+tree-sitter==0.24.0
+tree-sitter-language-pack==0.9.0
