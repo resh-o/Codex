@@ -1,0 +1,23 @@
+.claude/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node/Next.js
+node_modules/
+.next/
+
+# Env/secrets
+.env
+.env.local
+
+# Cloned repos (ingestion working dir)
+repos/
+tmp/
+
+# OS/editor
+.DS_Store
+.vscode/
