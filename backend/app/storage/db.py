@@ -32,7 +32,15 @@ _pool_lock = threading.Lock()
 
 
 def _configure_connection(conn: psycopg.Connection) -> None:
-    """Register the pgvector adapter on a freshly-opened pooled connection."""
+    """Prepare a freshly-opened pooled connection for pgvector use.
+
+    ``register_vector`` needs the ``vector`` type to already exist, so we ensure
+    the extension first (idempotent; a no-op on Supabase where it is pre-enabled)
+    before registering the adapter. This avoids a chicken-and-egg failure on a
+    brand-new database where the schema hasn't been applied yet.
+    """
+    conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    conn.commit()
     register_vector(conn)
 
 

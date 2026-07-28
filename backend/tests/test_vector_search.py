@@ -165,11 +165,17 @@ def test_real_pgvector_upsert_search_and_idempotency() -> None:
     from app.storage.repository import count_chunks, search_similar, upsert_chunks
 
     db_module.close_pool()
-    settings = Settings(database_url=TEST_DB, embedding_dim=4)
+    settings = Settings(database_url=TEST_DB)
     pool = db_module.get_pool(settings)
     db_module.apply_schema(settings)
 
     repo = f"https://example.com/test-{uuid.uuid4().hex[:8]}"
+
+    # The production schema fixes the column at vector(768); pad synthetic
+    # vectors to that width so we exercise the real column and index.
+    def vec(*head: float) -> list[float]:
+        v = list(head) + [0.0] * (768 - len(head))
+        return v
 
     def ec(name, line, vector) -> EmbeddedChunk:
         return EmbeddedChunk(
@@ -191,9 +197,9 @@ def test_real_pgvector_upsert_search_and_idempotency() -> None:
         )
 
     items = [
-        ec("east", 1, [1.0, 0.0, 0.0, 0.0]),
-        ec("north", 2, [0.0, 1.0, 0.0, 0.0]),
-        ec("eastish", 3, [0.9, 0.1, 0.0, 0.0]),
+        ec("east", 1, vec(1.0, 0.0, 0.0)),
+        ec("north", 2, vec(0.0, 1.0, 0.0)),
+        ec("eastish", 3, vec(0.9, 0.1, 0.0)),
     ]
 
     first = upsert_chunks(items, pool=pool)
@@ -201,7 +207,7 @@ def test_real_pgvector_upsert_search_and_idempotency() -> None:
     assert count_chunks(repo, pool=pool) == 3
 
     # Query pointing "east" should rank east first, then eastish, then north.
-    hits = search_similar([1.0, 0.0, 0.0, 0.0], top_k=3, repo_url=repo, pool=pool)
+    hits = search_similar(vec(1.0, 0.0, 0.0), top_k=3, repo_url=repo, pool=pool)
     assert [h.name for h in hits] == ["east", "eastish", "north"]
     sims = [h.similarity for h in hits]
     assert sims == sorted(sims, reverse=True)
