@@ -1,0 +1,38 @@
+# Codex — Stage 1 (ingestion + AST chunking).
+#
+# Only the backend runs for now. The database service is intentionally left as a
+# commented placeholder: Stage 2 (Gemini embeddings + Supabase pgvector) will
+# uncomment and wire it up, and the backend will gain DB env vars + a depends_on.
+
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Where cloned repos are checked out inside the container.
+      CODEX_WORKDIR: /data/repos
+    volumes:
+      # Persist cloned repos across restarts (and let you inspect them).
+      - repos:/data/repos
+    # depends_on:
+    #   - db          # <-- Stage 2
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 placeholder: Postgres + pgvector (Supabase-compatible).
+  # ---------------------------------------------------------------------------
+  # db:
+  #   image: pgvector/pgvector:pg16
+  #   environment:
+  #     POSTGRES_USER: codex
+  #     POSTGRES_PASSWORD: codex
+  #     POSTGRES_DB: codex
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+
+volumes:
+  repos:
+  # pgdata:   # <-- Stage 2
