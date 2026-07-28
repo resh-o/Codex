@@ -1,31 +1,93 @@
-"""FastAPI app exposing the Stage-1 ingestion pipeline.
+"""FastAPI app: Stage 1 ingestion + Stage 2 embeddings & vector search.
 
-Stage 1 does not persist anything -- ``POST /ingest`` runs the
-clone -> walk -> chunk pipeline in-process and returns a JSON summary so the
-pipeline can be exercised end-to-end over HTTP.  Persistence (pgvector) arrives
-in Stage 2.
+Endpoints
+---------
+* ``POST /ingest`` — Stage 1: clone + chunk, return a summary (no persistence).
+* ``POST /embed``  — Stage 2: ingest + embed + upsert into pgvector.
+* ``POST /search`` — Stage 2: flat cosine similarity search over stored chunks.
+
+Credential/connection problems (missing Gemini key, unreachable DB) surface as
+clean HTTP errors rather than leaking raw tracebacks to the client.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections import Counter
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .config import ConfigError, get_settings
+from .embeddings import Embedder, EmbeddingError, GeminiClient
 from .ingestion import Chunk, CloneError, ingest_repo
+from .search import VectorSearchService
+from .storage import (
+    StorageError,
+    apply_schema,
+    get_existing_keys,
+    get_pool,
+    search_similar,
+    upsert_chunks,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Codex Ingestion API",
-    version="0.1.0",
-    description="Stage 1: repo ingestion + AST chunking.",
+    title="Codex API",
+    version="0.2.0",
+    description="Stage 1 (AST chunking) + Stage 2 (embeddings & vector search).",
 )
 
 SAMPLE_SIZE = 5
+
+
+# --------------------------------------------------------------------------- #
+# Lazily-built, process-wide singletons for the embedding + search stack.
+# --------------------------------------------------------------------------- #
+
+_lock = threading.Lock()
+_embedder: Embedder | None = None
+_search_service: VectorSearchService | None = None
+_schema_ready = False
+
+
+def _get_embedder() -> Embedder:
+    global _embedder
+    if _embedder is None:
+        with _lock:
+            if _embedder is None:
+                settings = get_settings()
+                client = GeminiClient(settings)
+                _embedder = Embedder(client, batch_size=settings.embedding_batch_size)
+    return _embedder
+
+
+def _get_search_service() -> VectorSearchService:
+    global _search_service
+    if _search_service is None:
+        with _lock:
+            if _search_service is None:
+                _search_service = VectorSearchService(_get_embedder())
+    return _search_service
+
+
+def _ensure_storage_ready() -> None:
+    """Open the pool and apply the schema once (idempotent)."""
+    global _schema_ready
+    get_pool()  # raises ConfigError/StorageError with a clean message
+    if not _schema_ready:
+        with _lock:
+            if not _schema_ready:
+                apply_schema()
+                _schema_ready = True
+
+
+# --------------------------------------------------------------------------- #
+# Schemas
+# --------------------------------------------------------------------------- #
 
 
 class IngestRequest(BaseModel):
@@ -54,6 +116,60 @@ class IngestResponse(BaseModel):
     sample_chunks: list[ChunkSample]
 
 
+class EmbedRequest(BaseModel):
+    repo_url: str = Field(..., description="A cloneable git URL (https or ssh).")
+
+
+class EmbedResponse(BaseModel):
+    repo_url: str
+    commit_sha: str
+    files_processed: int
+    chunks_total: int
+    chunks_embedded: int
+    chunks_skipped: int
+    embedding_failures: int
+    rows_inserted: int
+    rows_updated: int
+    embedding_model: str
+    embedding_dim: int
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., description="Natural-language or code query.")
+    repo_url: str | None = Field(None, description="Optional: restrict to one repo.")
+    top_k: int = Field(10, ge=1, le=100)
+
+
+class SearchResultModel(BaseModel):
+    repo_url: str
+    file_path: str
+    language: str
+    chunk_type: str
+    name: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    similarity: float
+    snippet: str
+
+
+class SearchResponse(BaseModel):
+    query: str
+    repo_url: str | None
+    count: int
+    results: list[SearchResultModel]
+
+
+# --------------------------------------------------------------------------- #
+# Endpoints
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 def _sample(chunk: Chunk) -> ChunkSample:
     return ChunkSample(
         file_path=chunk.file_path,
@@ -68,31 +184,21 @@ def _sample(chunk: Chunk) -> ChunkSample:
     )
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(request: IngestRequest) -> IngestResponse:
-    """Clone a repo, chunk it, and return a summary of what was produced."""
+    """Stage 1: clone a repo, chunk it, return a summary (no persistence)."""
     try:
         result = ingest_repo(request.repo_url)
     except CloneError as exc:
-        # Clone failures are user/input errors, not server faults.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - unexpected server fault
+    except Exception as exc:  # pragma: no cover
         logger.exception("Ingestion failed for %s", request.repo_url)
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
 
     chunks = result.chunks
     by_type = Counter(c.chunk_type for c in chunks)
     by_language = Counter(c.language for c in chunks)
-
-    # A readable, representative sample rather than the full dump: spread across
-    # the produced chunk types where possible.
     sample = _pick_sample(chunks)
-
     return IngestResponse(
         repo_url=result.repo_url,
         commit_sha=result.commit_sha,
@@ -101,6 +207,90 @@ def ingest(request: IngestRequest) -> IngestResponse:
         chunks_by_type=dict(sorted(by_type.items())),
         chunks_by_language=dict(sorted(by_language.items())),
         sample_chunks=[_sample(c) for c in sample],
+    )
+
+
+@app.post("/embed", response_model=EmbedResponse)
+def embed(request: EmbedRequest) -> EmbedResponse:
+    """Stage 2: ingest, embed new chunks, and upsert them into pgvector."""
+    settings = get_settings()
+    try:
+        embedder = _get_embedder()
+        _ensure_storage_ready()
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        result = ingest_repo(request.repo_url)
+    except CloneError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    chunks = result.chunks
+    # Skip chunks already stored for this exact commit (idempotent re-runs).
+    try:
+        existing = get_existing_keys(result.repo_url, result.commit_sha)
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    to_embed = [
+        c
+        for c in chunks
+        if (c.file_path, c.start_line, c.end_line) not in existing
+    ]
+
+    try:
+        embedded, stats = embedder.embed_chunks(to_embed)
+    except (ConfigError, EmbeddingError) as exc:
+        raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}") from exc
+
+    try:
+        upserted = upsert_chunks(embedded)
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return EmbedResponse(
+        repo_url=result.repo_url,
+        commit_sha=result.commit_sha,
+        files_processed=len(result.files),
+        chunks_total=len(chunks),
+        chunks_embedded=stats.chunks_embedded,
+        chunks_skipped=len(chunks) - len(to_embed),
+        embedding_failures=stats.failures,
+        rows_inserted=upserted.inserted,
+        rows_updated=upserted.updated,
+        embedding_model=settings.embedding_model,
+        embedding_dim=settings.embedding_dim,
+    )
+
+
+@app.post("/search", response_model=SearchResponse)
+def search(request: SearchRequest) -> SearchResponse:
+    """Stage 2: flat cosine similarity search over stored chunks."""
+    try:
+        service = _get_search_service()
+        _ensure_storage_ready()
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        results = service.search(
+            request.query, top_k=request.top_k, repo_url=request.repo_url
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConfigError, EmbeddingError) as exc:
+        raise HTTPException(status_code=502, detail=f"Query embedding failed: {exc}") from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return SearchResponse(
+        query=request.query,
+        repo_url=request.repo_url,
+        count=len(results),
+        results=[SearchResultModel(**vars(r)) for r in results],
     )
 
 
@@ -116,7 +306,6 @@ def _pick_sample(chunks: list[Chunk]) -> list[Chunk]:
             diverse.append(chunk)
         if len(diverse) >= SAMPLE_SIZE:
             break
-    # Top up with the earliest chunks if we still have room.
     for chunk in chunks:
         if len(diverse) >= SAMPLE_SIZE:
             break
