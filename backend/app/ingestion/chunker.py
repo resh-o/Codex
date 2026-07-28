@@ -398,7 +398,7 @@ def _module_chunk(root: Node, ctx: _Context) -> Optional[Chunk]:
     kept: list[Node] = [
         child
         for child in root.named_children
-        if not _is_top_level_def(child, ctx)
+        if child.type != "comment" and not _is_top_level_def(child, ctx)
     ]
     if not kept:
         return None
