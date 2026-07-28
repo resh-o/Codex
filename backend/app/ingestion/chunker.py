@@ -113,6 +113,7 @@ def chunk_file(
         file_path=file_path,
         language=language,
         grammar=grammar,
+        source=source,
         source_bytes=source_bytes,
         repo_url=repo_url,
         commit_sha=commit_sha,
@@ -142,6 +143,7 @@ class _Context:
         "language",
         "grammar",
         "source_bytes",
+        "lines",
         "repo_url",
         "commit_sha",
     )
@@ -151,6 +153,7 @@ class _Context:
         file_path: str,
         language: str,
         grammar: str,
+        source: str,
         source_bytes: bytes,
         repo_url: str,
         commit_sha: str,
@@ -159,6 +162,8 @@ class _Context:
         self.language = language
         self.grammar = grammar
         self.source_bytes = source_bytes
+        # Split on "\n" only, matching tree-sitter's row semantics exactly.
+        self.lines = source.split("\n")
         self.repo_url = repo_url
         self.commit_sha = commit_sha
 
@@ -167,9 +172,19 @@ class _Context:
         return self.grammar == "python"
 
     def text(self, node: Node) -> str:
+        """Exact source text of a node, by byte range (starts at the node)."""
         return self.source_bytes[node.start_byte : node.end_byte].decode(
             "utf-8", errors="replace"
         )
+
+    def line_text(self, start_row: int, end_row: int) -> str:
+        """Whole-line text for an inclusive 0-indexed row range.
+
+        Unlike :meth:`text`, this includes leading indentation on the first line
+        and trailing content to the end of the last line, so a chunk's content
+        equals the exact lines its ``start_line``/``end_line`` claim.
+        """
+        return "\n".join(self.lines[start_row : end_row + 1])
 
 
 def _node_name(node: Node) -> Optional[str]:
@@ -262,7 +277,7 @@ def _walk(node: Node, ancestors: tuple[tuple[str, str], ...], ctx: _Context, out
                 parent_name=parent_name,
                 start_line=span.start_point[0] + 1,
                 end_line=span.end_point[0] + 1,
-                content=ctx.text(span),
+                content=ctx.line_text(span.start_point[0], span.end_point[0]),
                 docstring=_extract_docstring(node, span, ctx),
             )
         )
