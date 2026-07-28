@@ -11,7 +11,10 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      # Optional: the stack starts without it (embedding endpoints then return a
+      # clear 503 until GEMINI_API_KEY is provided).
+      - path: ./backend/.env
+        required: false
     environment:
       # Overrides env_file: inside the compose network the DB host is `db`.
       CODEX_WORKDIR: /data/repos
