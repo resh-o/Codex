@@ -11,3 +11,14 @@ GitPython==3.1.57
 # prebuilt wheels for python/typescript/tsx/javascript.
 tree-sitter==0.26.0
 tree-sitter-language-pack==1.13.5
+
+# --- Stage 2: embeddings + pgvector ---------------------------------------
+# Gemini embeddings via the current unified Google GenAI SDK (`from google import
+# genai`). Model: gemini-embedding-001 (see app/config.py).
+google-genai==2.14.0
+# Postgres access with raw SQL + connection pooling; pgvector adapter for the
+# `vector` type and `<=>` cosine operator.
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+pgvector==0.5.0
+numpy==2.5.1
