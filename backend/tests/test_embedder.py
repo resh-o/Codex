@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from app.config import Settings
+from app.config import ConfigError, Settings
 from app.embeddings.embedder import Embedder, content_input, rich_input
 from app.embeddings.gemini_client import (
     TASK_DOCUMENT,
@@ -193,6 +193,19 @@ def test_failed_batch_is_recorded_not_fatal() -> None:
     assert stats.failures == 1
     assert len(stats.errors) == 1
     assert len(embedded) == 2
+
+
+def test_config_error_propagates_and_is_not_counted_as_batch_failure() -> None:
+    """A missing-key ConfigError fails every batch -> surface it, don't swallow."""
+
+    def fn(texts, *, model, task_type, output_dim):
+        raise ConfigError("GEMINI_API_KEY is not set")
+
+    client = GeminiClient(_settings(), embed_fn=fn, sleep=lambda _: None)
+    embedder = Embedder(client, batch_size=2)
+    chunks = [_chunk(f"c{i}", f"x{i}") for i in range(3)]
+    with pytest.raises(ConfigError):
+        embedder.embed_chunks(chunks)
 
 
 def test_mismatched_vector_count_raises() -> None:

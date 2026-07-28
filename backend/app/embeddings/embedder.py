@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
+from ..config import ConfigError
 from ..ingestion.models import Chunk
 from .gemini_client import TASK_DOCUMENT, TASK_QUERY, GeminiClient
 
@@ -94,6 +95,10 @@ class Embedder:
             stats.approx_tokens += sum(len(t) for t in texts) // 4
             try:
                 vectors = self._client.embed(texts, task_type=TASK_DOCUMENT)
+            except ConfigError:
+                # Missing/invalid config (e.g. no API key) fails every batch --
+                # surface it immediately rather than reporting N "failures".
+                raise
             except Exception as exc:  # noqa: BLE001 - reported, not fatal
                 stats.failures += len(batch)
                 stats.errors.append(str(exc))

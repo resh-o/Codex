@@ -48,7 +48,9 @@ SAMPLE_SIZE = 5
 # Lazily-built, process-wide singletons for the embedding + search stack.
 # --------------------------------------------------------------------------- #
 
-_lock = threading.Lock()
+# Reentrant: _get_search_service() builds the embedder via _get_embedder()
+# while holding the lock, so the same thread must be able to re-acquire it.
+_lock = threading.RLock()
 _embedder: Embedder | None = None
 _search_service: VectorSearchService | None = None
 _schema_ready = False
@@ -241,8 +243,16 @@ def embed(request: EmbedRequest) -> EmbedResponse:
 
     try:
         embedded, stats = embedder.embed_chunks(to_embed)
-    except (ConfigError, EmbeddingError) as exc:
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EmbeddingError as exc:
         raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}") from exc
+
+    # If there was work to do and every batch failed, that's an error condition
+    # (e.g. an invalid key or the API being down), not a 200 with a sad summary.
+    if to_embed and stats.chunks_embedded == 0 and stats.failures > 0:
+        detail = stats.errors[0] if stats.errors else "all embedding batches failed"
+        raise HTTPException(status_code=502, detail=f"Embedding failed: {detail}")
 
     try:
         upserted = upsert_chunks(embedded)
