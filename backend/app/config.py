@@ -38,6 +38,14 @@ class Settings:
     db_pool_min: int = 1
     db_pool_max: int = 10
 
+    # --- Hybrid retrieval (Stage 3) ----------------------------------------
+    # How many candidates to pull from each retriever before RRF fusion,
+    # as a multiple of top_k. Fusing two already-truncated top_k lists loses
+    # the cross-list signal RRF exists to capture.
+    search_overfetch_factor: int = 3
+    # RRF damping constant; 60 is the value from the original RRF paper.
+    rrf_k: int = 60
+
     @classmethod
     def from_env(cls) -> "Settings":
         def _int(name: str, default: int) -> int:
@@ -53,6 +61,10 @@ class Settings:
             database_url=os.environ.get("DATABASE_URL"),
             db_pool_min=_int("DB_POOL_MIN", cls.db_pool_min),
             db_pool_max=_int("DB_POOL_MAX", cls.db_pool_max),
+            search_overfetch_factor=_int(
+                "SEARCH_OVERFETCH_FACTOR", cls.search_overfetch_factor
+            ),
+            rrf_k=_int("RRF_K", cls.rrf_k),
         )
 
     def require_gemini(self) -> str:

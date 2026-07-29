@@ -1,38 +1,20 @@
 """Flat (vector-only) similarity search.
 
 Embeds a query with the same Gemini model used for documents, then delegates to
-the repository's pgvector cosine search.  Deliberately thin -- hybrid/keyword
-fusion is Stage 3.
+the repository's pgvector cosine search.  Deliberately thin -- the keyword half
+lives in ``keyword_search.py`` and the two are combined in ``hybrid_search.py``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 from ..embeddings.embedder import Embedder
 from ..storage.repository import SearchHit, search_similar
-
-DEFAULT_SNIPPET_CHARS = 400
+from .results import DEFAULT_SNIPPET_CHARS, SearchResult, snippet
 
 # The repository search function, injectable for tests.
 SearchFn = Callable[..., list[SearchHit]]
-
-
-@dataclass
-class SearchResult:
-    """A single result formatted for API responses."""
-
-    repo_url: str
-    file_path: str
-    language: str
-    chunk_type: str
-    name: str
-    qualified_name: str
-    start_line: int
-    end_line: int
-    similarity: float
-    snippet: str
 
 
 class VectorSearchService:
@@ -61,6 +43,7 @@ class VectorSearchService:
 
     def _to_result(self, hit: SearchHit) -> SearchResult:
         return SearchResult(
+            id=hit.id,
             repo_url=hit.repo_url,
             file_path=hit.file_path,
             language=hit.language,
@@ -69,22 +52,10 @@ class VectorSearchService:
             qualified_name=hit.qualified_name,
             start_line=hit.start_line,
             end_line=hit.end_line,
+            snippet=snippet(hit.content, self._snippet_chars),
+            score=hit.similarity,
             similarity=hit.similarity,
-            snippet=_snippet(hit.content, self._snippet_chars),
         )
-
-
-def _snippet(content: str, max_chars: int) -> str:
-    """Truncate content to a readable snippet on a line/word boundary."""
-    content = content.strip()
-    if len(content) <= max_chars:
-        return content
-    cut = content[:max_chars]
-    # Prefer to end at the last newline, else the last space, for readability.
-    boundary = max(cut.rfind("\n"), cut.rfind(" "))
-    if boundary > max_chars // 2:
-        cut = cut[:boundary]
-    return cut.rstrip() + " …"
 
 
 def cosine_rank(

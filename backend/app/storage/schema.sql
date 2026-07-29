@@ -1,5 +1,5 @@
--- Codex Stage 2 schema: pgvector-backed chunk store.
--- Apply against your Supabase/Postgres database, e.g.:
+-- Codex schema: pgvector-backed chunk store (Stage 2) + full-text search
+-- (Stage 3).  Apply against your Supabase/Postgres database, e.g.:
 --   psql "$DATABASE_URL" -f app/storage/schema.sql
 -- Safe to run repeatedly (idempotent).
 
@@ -49,3 +49,45 @@ CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
 
 -- Helps the optional per-repo filter in search_similar().
 CREATE INDEX IF NOT EXISTS chunks_repo_idx ON chunks (repo_url, commit_sha);
+
+
+-- =========================================================================== --
+-- Stage 3 migration: keyword / full-text search
+--
+-- Written as an additive ALTER rather than a rewrite of the CREATE TABLE above,
+-- because Stage 2 databases already hold embedded chunks. Adding the column
+-- rewrites the table once to backfill it -- but it is derived purely from
+-- columns that are already there, so **no re-ingestion or re-embedding is
+-- needed**. Existing `embedding` values are untouched.
+-- =========================================================================== --
+
+-- A *generated* (always-in-sync) tsvector, so keyword search can never drift
+-- from `content` the way a trigger-maintained or app-maintained column can.
+-- The expression must be IMMUTABLE, hence the explicit `'english'::regconfig`
+-- (the one-argument to_tsvector() depends on default_text_search_config and is
+-- only STABLE, so it is not allowed here).
+--
+-- Weighting, highest first, via setweight():
+--   A  qualified_name -- an exact hit on `UserAuth.validate_token` is about as
+--                       strong a relevance signal as this corpus offers.
+--   B  name           -- the bare symbol, for queries that omit the class path.
+--   C  docstring      -- prose written specifically to describe this chunk.
+--   D  content        -- the body; the default (lowest) weight, since a token
+--                       appearing somewhere in a 60-line function says little.
+-- ts_rank_cd()'s default weight vector is {D,C,B,A} = {0.1, 0.2, 0.4, 1.0},
+-- i.e. a qualified_name hit counts 10x a body hit. We keep those defaults --
+-- tuning them belongs after Stage 5 produces eval numbers.
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS search_vector tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('english'::regconfig, coalesce(qualified_name, '')), 'A') ||
+        setweight(to_tsvector('english'::regconfig, coalesce(name, '')),           'B') ||
+        setweight(to_tsvector('english'::regconfig, coalesce(docstring, '')),      'C') ||
+        setweight(to_tsvector('english'::regconfig, coalesce(content, '')),        'D')
+    ) STORED;
+
+-- GIN is the right index for @@ lookups on a stored tsvector: slower to build
+-- and update than GiST, but far faster and exact for search, and this column
+-- only changes when a chunk is re-upserted.
+CREATE INDEX IF NOT EXISTS chunks_search_vector_gin
+    ON chunks USING gin (search_vector);

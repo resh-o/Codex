@@ -1,10 +1,11 @@
-"""FastAPI app: Stage 1 ingestion + Stage 2 embeddings & vector search.
+"""FastAPI app: Stage 1 ingestion, Stage 2 embeddings, Stage 3 hybrid search.
 
 Endpoints
 ---------
 * ``POST /ingest`` — Stage 1: clone + chunk, return a summary (no persistence).
 * ``POST /embed``  — Stage 2: ingest + embed + upsert into pgvector.
-* ``POST /search`` — Stage 2: flat cosine similarity search over stored chunks.
+* ``POST /search`` — Stage 3: hybrid (vector + keyword, RRF-fused) search, with
+  ``mode`` to fall back to either retriever on its own.
 
 Credential/connection problems (missing Gemini key, unreachable DB) surface as
 clean HTTP errors rather than leaking raw tracebacks to the client.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import Counter
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -22,13 +24,16 @@ from pydantic import BaseModel, Field
 from .config import ConfigError, get_settings
 from .embeddings import Embedder, EmbeddingError, GeminiClient
 from .ingestion import Chunk, CloneError, ingest_repo
-from .search import VectorSearchService
+from .search import (
+    HybridSearchService,
+    KeywordSearchService,
+    VectorSearchService,
+)
 from .storage import (
     StorageError,
     apply_schema,
     get_existing_keys,
     get_pool,
-    search_similar,
     upsert_chunks,
 )
 
@@ -37,8 +42,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Codex API",
-    version="0.2.0",
-    description="Stage 1 (AST chunking) + Stage 2 (embeddings & vector search).",
+    version="0.3.0",
+    description=(
+        "Stage 1 (AST chunking) + Stage 2 (embeddings) + Stage 3 (hybrid "
+        "vector/keyword retrieval with RRF fusion)."
+    ),
 )
 
 SAMPLE_SIZE = 5
