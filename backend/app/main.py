@@ -56,11 +56,12 @@ SAMPLE_SIZE = 5
 # Lazily-built, process-wide singletons for the embedding + search stack.
 # --------------------------------------------------------------------------- #
 
-# Reentrant: _get_search_service() builds the embedder via _get_embedder()
+# Reentrant: _get_hybrid_service() builds the embedder via _get_embedder()
 # while holding the lock, so the same thread must be able to re-acquire it.
 _lock = threading.RLock()
 _embedder: Embedder | None = None
-_search_service: VectorSearchService | None = None
+_hybrid_service: HybridSearchService | None = None
+_keyword_service: KeywordSearchService | None = None
 _schema_ready = False
 
 
@@ -75,13 +76,47 @@ def _get_embedder() -> Embedder:
     return _embedder
 
 
-def _get_search_service() -> VectorSearchService:
-    global _search_service
-    if _search_service is None:
+def _get_keyword_service() -> KeywordSearchService:
+    """Keyword search needs no embedder, so it is built independently.
+
+    That is what lets ``mode=keyword`` work on a box with no Gemini key.
+    """
+    global _keyword_service
+    if _keyword_service is None:
         with _lock:
-            if _search_service is None:
-                _search_service = VectorSearchService(_get_embedder())
-    return _search_service
+            if _keyword_service is None:
+                _keyword_service = KeywordSearchService()
+    return _keyword_service
+
+
+class _LazyVectorRetriever:
+    """Defers building the embedder until a search actually needs a vector.
+
+    Without this, constructing the hybrid service would demand a Gemini key up
+    front and ``mode=keyword`` -- which never embeds anything -- would 503 on a
+    box that only has a database. Errors from a missing key still surface, just
+    at the point the vector half is genuinely used.
+    """
+
+    def search(self, query: str, top_k: int = 10, repo_url: str | None = None):
+        return VectorSearchService(_get_embedder()).search(
+            query, top_k=top_k, repo_url=repo_url
+        )
+
+
+def _get_hybrid_service() -> HybridSearchService:
+    global _hybrid_service
+    if _hybrid_service is None:
+        with _lock:
+            if _hybrid_service is None:
+                settings = get_settings()
+                _hybrid_service = HybridSearchService(
+                    vector=_LazyVectorRetriever(),
+                    keyword=_get_keyword_service(),
+                    overfetch_factor=settings.search_overfetch_factor,
+                    rrf_k=settings.rrf_k,
+                )
+    return _hybrid_service
 
 
 def _ensure_storage_ready() -> None:
@@ -144,13 +179,25 @@ class EmbedResponse(BaseModel):
     embedding_dim: int
 
 
+SearchMode = Literal["hybrid", "vector", "keyword"]
+
+
 class SearchRequest(BaseModel):
     query: str = Field(..., description="Natural-language or code query.")
     repo_url: str | None = Field(None, description="Optional: restrict to one repo.")
     top_k: int = Field(10, ge=1, le=100)
+    mode: SearchMode = Field(
+        "hybrid",
+        description=(
+            "'hybrid' (default) fuses vector + keyword with RRF. 'vector' and "
+            "'keyword' run a single retriever, kept callable on their own so "
+            "Stage 5 can score hybrid against each baseline."
+        ),
+    )
 
 
 class SearchResultModel(BaseModel):
+    id: str
     repo_url: str
     file_path: str
     language: str
@@ -159,13 +206,25 @@ class SearchResultModel(BaseModel):
     qualified_name: str
     start_line: int
     end_line: int
-    similarity: float
     snippet: str
+
+    #: The score this result was ranked by in the requested mode.
+    score: float
+
+    # Diagnostics: populated per mode, null where inapplicable. Retained
+    # deliberately -- the eventual UI won't show these, but Stage 5's eval and
+    # any "why did this rank here?" debugging both need them.
+    similarity: float | None = None
+    keyword_score: float | None = None
+    vector_rank: int | None = None
+    keyword_rank: int | None = None
+    fused_score: float | None = None
 
 
 class SearchResponse(BaseModel):
     query: str
     repo_url: str | None
+    mode: SearchMode
     count: int
     results: list[SearchResultModel]
 
@@ -283,10 +342,14 @@ def embed(request: EmbedRequest) -> EmbedResponse:
 
 
 @app.post("/search", response_model=SearchResponse)
-def search(request: SearchRequest) -> SearchResponse:
-    """Stage 2: flat cosine similarity search over stored chunks."""
+async def search(request: SearchRequest) -> SearchResponse:
+    """Stage 3: hybrid (RRF-fused vector + keyword) search over stored chunks.
+
+    Async because hybrid mode fans the two retrievers out concurrently; the
+    blocking psycopg work happens in worker threads.
+    """
     try:
-        service = _get_search_service()
+        service = _get_hybrid_service()
         _ensure_storage_ready()
     except ConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -294,12 +357,19 @@ def search(request: SearchRequest) -> SearchResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        results = service.search(
-            request.query, top_k=request.top_k, repo_url=request.repo_url
+        results = await service.search(
+            request.query,
+            top_k=request.top_k,
+            repo_url=request.repo_url,
+            mode=request.mode,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (ConfigError, EmbeddingError) as exc:
+    except ConfigError as exc:
+        # Deferred by _LazyVectorRetriever, so a missing key lands here rather
+        # than at construction -- still a 503 (misconfigured), not a 502.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EmbeddingError as exc:
         raise HTTPException(status_code=502, detail=f"Query embedding failed: {exc}") from exc
     except StorageError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -307,6 +377,7 @@ def search(request: SearchRequest) -> SearchResponse:
     return SearchResponse(
         query=request.query,
         repo_url=request.repo_url,
+        mode=request.mode,
         count=len(results),
         results=[SearchResultModel(**vars(r)) for r in results],
     )
