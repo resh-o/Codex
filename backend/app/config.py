@@ -46,11 +46,29 @@ class Settings:
     # RRF damping constant; 60 is the value from the original RRF paper.
     rrf_k: int = 60
 
+    # --- Answer generation (Stage 4) ---------------------------------------
+    # Verified against Google's model list (July 2026): gemini-3.6-flash is the
+    # current GA workhorse and supports schema-constrained JSON output, which is
+    # what makes the citation requirement structural. Same API key as
+    # embeddings, so answering adds a model rather than a vendor.
+    answer_model: str = "gemini-3.6-flash"
+    # Grounded extraction, not prose. Near-zero temperature keeps the model
+    # copying the line ranges it was given instead of improvising them.
+    answer_temperature: float = 0.0
+    # Retrieval truncates chunk content to a snippet. 400 chars is right for a
+    # search result list and far too short to answer *from* -- most function
+    # bodies get cut mid-way -- so /ask retrieves with a much larger budget.
+    answer_context_chars: int = 2400
+
     @classmethod
     def from_env(cls) -> "Settings":
         def _int(name: str, default: int) -> int:
             raw = os.environ.get(name)
             return int(raw) if raw else default
+
+        def _float(name: str, default: float) -> float:
+            raw = os.environ.get(name)
+            return float(raw) if raw else default
 
         return cls(
             gemini_api_key=os.environ.get("GEMINI_API_KEY"),
@@ -65,6 +83,11 @@ class Settings:
                 "SEARCH_OVERFETCH_FACTOR", cls.search_overfetch_factor
             ),
             rrf_k=_int("RRF_K", cls.rrf_k),
+            answer_model=os.environ.get("GEMINI_ANSWER_MODEL", cls.answer_model),
+            answer_temperature=_float("ANSWER_TEMPERATURE", cls.answer_temperature),
+            answer_context_chars=_int(
+                "ANSWER_CONTEXT_CHARS", cls.answer_context_chars
+            ),
         )
 
     def require_gemini(self) -> str:

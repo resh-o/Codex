@@ -1,18 +1,20 @@
 # Codex — Codebase Q&A / RAG
 
 Codex is a codebase Q&A / RAG tool, built in stages and designed to be
-rigorously engineered and formally evaluated. **Implemented so far:** Stage 1
-(AST chunking) and Stage 2 (embeddings + flat vector search).
+rigorously engineered and formally evaluated. **Implemented so far:** Stages 1–4
+— ingestion, embeddings, hybrid retrieval, and answers whose citations are
+mechanically validated before they reach you.
 
 | Stage | What | Status |
 |-------|------|--------|
 | 1 | Ingestion + AST chunking (tree-sitter) | ✅ |
 | 2 | Embeddings (Gemini) + flat vector search (pgvector) | ✅ |
-| 3 | Hybrid retrieval (vector + keyword, RRF fusion) | ⬜ |
-| 4 | Citation enforcement | ⬜ |
+| 3 | Hybrid retrieval (vector + keyword, RRF fusion) | ✅ |
+| 4 | Citation enforcement (structured output, validated) | ✅ |
 | 5 | Formal eval suite | ⬜ |
 
-Jump to [Stage 2](#stage-2--embeddings--flat-vector-search).
+Jump to [Stage 2](#stage-2--embeddings--flat-vector-search) ·
+[Stage 4](#stage-4-citation-enforcement).
 
 ---
 
@@ -221,10 +223,137 @@ cd backend && pytest
   TEST_DATABASE_URL=postgresql://codex:codex@localhost:5432/codex pytest tests/test_vector_search.py
   ```
 
+---
+
+# Stage 3: Hybrid Retrieval
+
+`POST /search` fuses vector similarity with Postgres full-text keyword search
+using **reciprocal rank fusion** (`app/search/`: `vector_search.py`,
+`keyword_search.py`, `fusion.py`, `hybrid_search.py`). The two retrievers run
+concurrently and each is **overfetched** (`top_k × 3`) before fusing, so a chunk
+ranked #1 by keyword and #12 by vector — the exact-identifier case embeddings
+tend to bury — is still recoverable.
+
+`mode` selects `hybrid` (default), `vector`, or `keyword`; the single-retriever
+modes stay first-class so Stage 5 can score hybrid *against* each baseline. Every
+result carries per-mode diagnostics (`similarity`, `keyword_score`,
+`vector_rank`, `keyword_rank`, `fused_score`) explaining why it ranked where it
+did.
+
+---
+
+# Stage 4: Citation Enforcement
+
+`POST /ask` turns retrieval into an answering system. The distinguishing claim
+is not "the model is prompted to cite sources" — it's that **a validator sits
+between generation and the response and mechanically checks every citation**
+against the chunks that were actually retrieved for that question. Nothing
+unverified reaches the caller.
+
+## The pipeline
+
+1. **Retrieve** via Stage 3 hybrid search. The retrieved set is simultaneously
+   the model's context and the validator's ground truth — which is what makes
+   validation meaningful rather than decorative.
+2. **Generate** with Gemini in **JSON-schema-constrained mode**
+   (`response_schema`), not free text parsed with regex.
+3. **Validate** every citation (below).
+4. **Retry once, with the failures named**: the second attempt is told exactly
+   which citation failed and why ("`app/auth/jwt.py:1-25` refers to a file that
+   is not in the retrieved context"), so it corrects rather than re-rolls.
+5. **Strip, don't ship.** Claims still carrying a bad citation are removed and
+   reported. A visible gap beats an invisible fabrication.
+
+## Why the citation requirement is structural
+
+`Claim.citations` is `min_length=1` in the Pydantic model, which the SDK
+converts to `min_items: 1` in the JSON schema the API decodes against — and it
+is re-checked when the response is parsed. A claim with no citation cannot be
+constructed, so it cannot reach the validator, let alone a user. (A test asserts
+the wire schema still carries `min_items: 1`, so a refactor can't quietly
+downgrade the guarantee to a polite request in the prompt.)
+
+## Model choice
+
+**`gemini-3.6-flash`** (`GEMINI_ANSWER_MODEL`), the current GA workhorse
+verified against Google's model list, July 2026. Two reasons: the project
+already authenticates to Gemini for embeddings, so answering adds a model rather
+than a second vendor and a second failure mode; and its `response_schema` mode
+takes a Pydantic model directly, which is what makes the citation rule
+structural. Schema-constrained JSON, not tool-calling — there's one thing to
+produce and no side effects, so a forced function call would be the same
+constraint in a bigger envelope. Temperature defaults to `0.0`: this is grounded
+extraction, and the model should copy line ranges, not improvise them.
+
+## The validation rule
+
+A citation is valid when **a single retrieved chunk fully contains it**: same
+`file_path`, and `chunk.start_line ≤ citation.start_line ≤ citation.end_line ≤
+chunk.end_line`. Containment in one chunk — not overlap, and not containment in
+the union of several. A half-overlapping citation is rejected because those
+overhanging lines were never in the model's context. A claim is valid only if
+*every* one of its citations is.
+
+Failures are categorised: `file_not_in_retrieved_set`,
+`line_range_not_in_chunk`, `line_range_invalid`.
+
+The important distinction: a citation to `app/config.py` would pass any "does
+this path exist?" check, but if nothing was retrieved from it, the model cannot
+have read it — so it fails. Validation is against *this question's* evidence,
+not the repo at large.
+
+## New pieces
+
+```
+app/answering/
+  models.py         # Citation / Claim / Answer — the schema the model must fill
+  prompt.py         # system + user prompt construction, and retry feedback
+  generator.py      # schema-constrained Gemini call; clear errors on bad responses
+  validator.py      # the core: mechanical citation checking + scoring output
+  answer_service.py # retrieve → generate → validate → retry once → strip
+```
+
+## Call it
+
+```bash
+curl -X POST localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "how are command options parsed?", "repo_url": "https://github.com/pallets/click", "top_k": 10}'
+```
+
+The response is the answer **plus** its validation metadata: `attempts`,
+`retried`, per-claim/per-citation verdicts with reasons, any `stripped_claims`
+and why, a `validation_history` entry per attempt, and the `sources` that were
+citable. Errors are clean: `404` when retrieval finds nothing relevant (better
+than answering uncited), `502` when the model call fails, `503` on missing
+credentials.
+
+## Built for Stage 5
+
+`ValidationResult` is scoring data, not a one-off HTTP payload. Every result
+carries `citation_precision`, `claim_support_rate`, and the raw counts, and
+`validation` reports what the model *produced*, not what survived stripping —
+otherwise the metric would always read as perfect. `validation_history` records
+each attempt, so the eval can measure whether the corrective retry actually
+repairs citations.
+
+## Run the Stage 4 tests
+
+```bash
+cd backend && pytest tests/test_validator.py tests/test_answer_service.py
+```
+
+- `test_validator.py` — pure unit tests: valid containment cases, each invalid
+  category, claim-level semantics, and the aggregate rates.
+- `test_answer_service.py` — orchestration against a scripted LLM: valid on the
+  first try, invalid → retry → fixed, invalid → retry → **still** invalid →
+  stripped, plus the generator's malformed-response paths and the `/ask`
+  contract. **No live LLM calls anywhere in the suite.**
+
 ## Deliberately *not* included yet
 
-- **Stage 3** — hybrid retrieval (vector + keyword/BM25, RRF fusion).
-- **Stage 4** — citation enforcement (structured, validated file/line citations).
 - **Stage 5** — the formal eval suite (retrieval + citation metrics).
-- Frontend, and any answering/generation logic.
+- Frontend, and any conversation history / multi-turn.
+- More than one retry, or a configurable retry budget — a fixed budget keeps the
+  "does targeted feedback fix citations?" question measurable in Stage 5.
 - Vector-index tuning (HNSW `m`/`ef`, or IVFFlat lists) — correctness first.

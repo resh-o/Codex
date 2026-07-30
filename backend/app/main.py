@@ -1,4 +1,4 @@
-"""FastAPI app: Stage 1 ingestion, Stage 2 embeddings, Stage 3 hybrid search.
+"""FastAPI app: Stages 1-4 (ingest, embed, search, answer).
 
 Endpoints
 ---------
@@ -6,6 +6,8 @@ Endpoints
 * ``POST /embed``  — Stage 2: ingest + embed + upsert into pgvector.
 * ``POST /search`` — Stage 3: hybrid (vector + keyword, RRF-fused) search, with
   ``mode`` to fall back to either retriever on its own.
+* ``POST /ask``    — Stage 4: retrieve, generate a cited answer, and validate
+  every citation against the retrieved chunks before returning it.
 
 Credential/connection problems (missing Gemini key, unreachable DB) surface as
 clean HTTP errors rather than leaking raw tracebacks to the client.
@@ -21,6 +23,13 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .answering import (
+    AnswerGenerator,
+    AnswerResult,
+    AnswerService,
+    GenerationError,
+    NoContextError,
+)
 from .config import ConfigError, get_settings
 from .embeddings import Embedder, EmbeddingError, GeminiClient
 from .ingestion import Chunk, CloneError, ingest_repo
@@ -42,10 +51,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Codex API",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Stage 1 (AST chunking) + Stage 2 (embeddings) + Stage 3 (hybrid "
-        "vector/keyword retrieval with RRF fusion)."
+        "vector/keyword retrieval with RRF fusion) + Stage 4 (answers with "
+        "mechanically-validated citations)."
     ),
 )
 
@@ -61,7 +71,9 @@ SAMPLE_SIZE = 5
 _lock = threading.RLock()
 _embedder: Embedder | None = None
 _hybrid_service: HybridSearchService | None = None
+_answer_search_service: HybridSearchService | None = None
 _keyword_service: KeywordSearchService | None = None
+_answer_service: AnswerService | None = None
 _schema_ready = False
 
 
@@ -98,10 +110,31 @@ class _LazyVectorRetriever:
     at the point the vector half is genuinely used.
     """
 
+    def __init__(self, snippet_chars: int | None = None) -> None:
+        self._snippet_chars = snippet_chars
+
     def search(self, query: str, top_k: int = 10, repo_url: str | None = None):
-        return VectorSearchService(_get_embedder()).search(
+        kwargs = {}
+        if self._snippet_chars is not None:
+            kwargs["snippet_chars"] = self._snippet_chars
+        return VectorSearchService(_get_embedder(), **kwargs).search(
             query, top_k=top_k, repo_url=repo_url
         )
+
+
+def _build_hybrid_service(snippet_chars: int | None = None) -> HybridSearchService:
+    settings = get_settings()
+    keyword = (
+        _get_keyword_service()
+        if snippet_chars is None
+        else KeywordSearchService(snippet_chars=snippet_chars)
+    )
+    return HybridSearchService(
+        vector=_LazyVectorRetriever(snippet_chars),
+        keyword=keyword,
+        overfetch_factor=settings.search_overfetch_factor,
+        rrf_k=settings.rrf_k,
+    )
 
 
 def _get_hybrid_service() -> HybridSearchService:
@@ -109,14 +142,38 @@ def _get_hybrid_service() -> HybridSearchService:
     if _hybrid_service is None:
         with _lock:
             if _hybrid_service is None:
-                settings = get_settings()
-                _hybrid_service = HybridSearchService(
-                    vector=_LazyVectorRetriever(),
-                    keyword=_get_keyword_service(),
-                    overfetch_factor=settings.search_overfetch_factor,
-                    rrf_k=settings.rrf_k,
-                )
+                _hybrid_service = _build_hybrid_service()
     return _hybrid_service
+
+
+def _get_answer_search_service() -> HybridSearchService:
+    """Same retrieval, bigger excerpts.
+
+    /search returns snippets for a human to scan; /ask returns them to a model
+    that must answer *from* them. The 400-char default cuts most functions in
+    half, so the answering path retrieves with ``answer_context_chars`` instead.
+    """
+    global _answer_search_service
+    if _answer_search_service is None:
+        with _lock:
+            if _answer_search_service is None:
+                _answer_search_service = _build_hybrid_service(
+                    get_settings().answer_context_chars
+                )
+    return _answer_search_service
+
+
+def _get_answer_service() -> AnswerService:
+    global _answer_service
+    if _answer_service is None:
+        with _lock:
+            if _answer_service is None:
+                settings = get_settings()
+                _answer_service = AnswerService(
+                    search=_get_answer_search_service(),
+                    generator=AnswerGenerator(settings),
+                )
+    return _answer_service
 
 
 def _ensure_storage_ready() -> None:
@@ -227,6 +284,26 @@ class SearchResponse(BaseModel):
     mode: SearchMode
     count: int
     results: list[SearchResultModel]
+
+
+class AskRequest(BaseModel):
+    query: str = Field(..., description="A natural-language question about the code.")
+    repo_url: str | None = Field(
+        None,
+        description=(
+            "Optional: restrict retrieval to one repo. Left optional for "
+            "consistency with /search; supply it whenever more than one "
+            "repository has been embedded."
+        ),
+    )
+    top_k: int = Field(10, ge=1, le=100, description="Chunks to retrieve and cite from.")
+
+
+#: The response *is* AnswerResult: the answer plus the validation metadata
+#: (attempts, per-claim verdicts, stripped claims, aggregate citation rates)
+#: that Stage 5 will score on. Kept as one model so the eval harness and the API
+#: consume the same shape rather than two that drift apart.
+AskResponse = AnswerResult
 
 
 # --------------------------------------------------------------------------- #
@@ -381,6 +458,48 @@ async def search(request: SearchRequest) -> SearchResponse:
         count=len(results),
         results=[SearchResultModel(**vars(r)) for r in results],
     )
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(request: AskRequest) -> AnswerResult:
+    """Stage 4: answer a question, with every citation checked before it ships.
+
+    Retrieval, generation, validation, one corrective retry, then stripping of
+    anything still unsupported -- see :mod:`app.answering.answer_service`. The
+    response carries the validation verdict alongside the answer, including any
+    claims that were removed and why.
+    """
+    try:
+        service = _get_answer_service()
+        _ensure_storage_ready()
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        return await service.answer_question(
+            request.query, repo_url=request.repo_url, top_k=request.top_k
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NoContextError as exc:
+        # Nothing retrieved: answering anyway would mean answering uncited, which
+        # is the one thing this stage exists to prevent.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConfigError as exc:
+        # Deferred: a missing Gemini key surfaces at the embed/generate call.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EmbeddingError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Query embedding failed: {exc}"
+        ) from exc
+    except GenerationError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Answer generation failed: {exc}"
+        ) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _pick_sample(chunks: list[Chunk]) -> list[Chunk]:
